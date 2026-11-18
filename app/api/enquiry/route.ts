@@ -1,35 +1,32 @@
 import { NextResponse } from "next/server";
-import { PrismaClient } from "@/app/generated/prisma/client";
-import { PrismaPg } from "@prisma/adapter-pg";
+import { prisma } from "@/app/lib/prisma";
 import { Resend } from "resend";
-
-/* =========================================================
-   PRISMA
-========================================================= */
-
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
-
-const adapter = new PrismaPg({
-  connectionString: process.env.DATABASE_URL!,
-});
-
-const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    adapter,
-  });
-
-if (process.env.NODE_ENV !== "production") {
-  globalForPrisma.prisma = prisma;
-}
 
 /* =========================================================
    RESEND
 ========================================================= */
 
 const resend = new Resend(process.env.RESEND_API_KEY);
+
+/* =========================================================
+   ENQUIRY RATE LIMITER (In-Memory IP Limiting)
+========================================================= */
+
+const enquiryIpMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkEnquiryRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const record = enquiryIpMap.get(ip);
+  if (!record || now > record.resetAt) {
+    enquiryIpMap.set(ip, { count: 1, resetAt: now + 10 * 60 * 1000 });
+    return true;
+  }
+  if (record.count >= 6) {
+    return false;
+  }
+  record.count += 1;
+  return true;
+}
 
 /* =========================================================
    HTML ESCAPE
@@ -50,6 +47,21 @@ function escapeHtml(value: string) {
 
 export async function POST(request: Request) {
   try {
+    const ip =
+      request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+      request.headers.get("x-real-ip") ||
+      "127.0.0.1";
+
+    if (!checkEnquiryRateLimit(ip)) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Too many enquiries submitted from this location. Please try again in 10 minutes.",
+        },
+        { status: 429 }
+      );
+    }
+
     /* =====================================================
        GET REQUEST DATA
     ===================================================== */
@@ -63,6 +75,9 @@ export async function POST(request: Request) {
       projectType,
       budget,
       message,
+      country,
+      countryCode,
+      currency,
     } = body;
 
     /* =====================================================
@@ -100,6 +115,18 @@ export async function POST(request: Request) {
     const cleanMessage =
       String(message).trim();
 
+    const cleanCountry = country
+      ? String(country).trim()
+      : null;
+
+    const cleanCountryCode = countryCode
+      ? String(countryCode).trim().toUpperCase()
+      : null;
+
+    const cleanCurrency = currency
+      ? String(currency).trim().toUpperCase()
+      : null;
+
     /* =====================================================
        EMAIL VALIDATION
     ===================================================== */
@@ -130,11 +157,14 @@ export async function POST(request: Request) {
           projectType: cleanProjectType,
           budget: cleanBudget,
           message: cleanMessage,
+          country: cleanCountry,
+          countryCode: cleanCountryCode,
+          currency: cleanCurrency,
         },
       });
 
     console.log(
-      `New project enquiry saved: ${enquiry.id}`
+      `New project enquiry saved: ${enquiry.id} (${cleanCountry || "Unknown"} / ${cleanCurrency || "USD"})`
     );
 
     /* =====================================================
@@ -155,26 +185,57 @@ export async function POST(request: Request) {
         ? escapeHtml(cleanBudget)
         : "Not specified";
 
+    const emailCountry =
+      cleanCountry
+        ? escapeHtml(cleanCountry)
+        : null;
+
+    const emailCountryCode =
+      cleanCountryCode
+        ? escapeHtml(cleanCountryCode)
+        : null;
+
+    const emailCurrency =
+      cleanCurrency
+        ? escapeHtml(cleanCurrency)
+        : null;
+
     const emailMessage =
       escapeHtml(cleanMessage);
 
     /* =====================================================
-       SEND EMAIL
-       
-       IMPORTANT:
-       We don't await this operation.
-
-       This means the visitor doesn't have to wait
-       for Resend to finish before getting a response.
+       RESOLVE NOTIFICATION EMAIL
     ===================================================== */
 
-    void resend.emails
-      .send({
+    let recipientEmail = "firoznissar@gmail.com";
+    try {
+      const configRecord = await prisma.systemConfig.findUnique({
+        where: { key: "portfolio_config" },
+      });
+      if (configRecord && configRecord.value) {
+        const val = typeof configRecord.value === "string" ? JSON.parse(configRecord.value) : configRecord.value;
+        if (val.enquirySettings?.notificationEmail) {
+          recipientEmail = val.enquirySettings.notificationEmail;
+        }
+      }
+    } catch {
+      // Fallback to default
+    }
+
+    /* =====================================================
+       SEND EMAIL VIA RESEND
+    ===================================================== */
+
+    let emailDelivered = false;
+    let emailId: string | undefined = undefined;
+
+    try {
+      const emailResult = await resend.emails.send({
         from:
           "Portfolio Enquiry <onboarding@resend.dev>",
 
-        // Resend testing mode allows your own account email
-        to: ["firoznissar@gmail.com"],
+        // Resend recipient address
+        to: [recipientEmail],
 
         // Clicking Reply will reply to the client
         replyTo: cleanEmail,
@@ -306,6 +367,29 @@ export async function POST(request: Request) {
                     </strong>.
                   </p>
 
+                  ${emailCountry
+            ? `
+                  <!-- DETECTED LOCATION & CURRENCY -->
+                  <div
+                    style="
+                      margin: 0 0 18px 0;
+                      padding: 12px 16px;
+                      background-color: #f8fafc;
+                      border-left: 4px solid #0284c7;
+                      border-radius: 6px;
+                      font-size: 13px;
+                      color: #334155;
+                      line-height: 1.6;
+                    "
+                  >
+                    <strong>Client Location:</strong> ${emailCountry} ${emailCountryCode ? `(${emailCountryCode})` : ""
+            } &bull; <strong>Detected Currency:</strong> ${emailCurrency || "USD"
+            }
+                  </div>
+                  `
+            : ""
+          }
+
                   <!-- CONTACT INFORMATION -->
 
                   <p
@@ -321,17 +405,16 @@ export async function POST(request: Request) {
                       ${emailAddress}
                     </strong>
 
-                    ${
-                      cleanPhone
-                        ? `
+                    ${cleanPhone
+            ? `
                           or phone number
 
                           <strong style="color: #18181b;">
                             ${emailPhone}
                           </strong>.
                         `
-                        : "."
-                    }
+            : "."
+          }
                   </p>
 
                   <!-- REQUIREMENTS -->
@@ -453,28 +536,21 @@ export async function POST(request: Request) {
             </body>
           </html>
         `,
-      })
-      .then((result) => {
-        if (result.error) {
-          console.error(
-            "RESEND EMAIL ERROR:",
-            result.error
-          );
-        } else {
-          console.log(
-            "Project enquiry email sent successfully."
-          );
-        }
-      })
-      .catch((error) => {
-        console.error(
-          "RESEND EMAIL ERROR:",
-          error
-        );
       });
 
+      if (emailResult.error) {
+        console.error("RESEND EMAIL ERROR:", emailResult.error);
+      } else {
+        emailDelivered = true;
+        emailId = emailResult.data?.id;
+        console.log(`Project enquiry email delivered via Resend. ID: ${emailId}`);
+      }
+    } catch (emailError) {
+      console.error("RESEND DISPATCH EXCEPTION:", emailError);
+    }
+
     /* =====================================================
-       RETURN IMMEDIATELY
+       RETURN CONFIRMATION
     ===================================================== */
 
     return NextResponse.json(
@@ -483,6 +559,11 @@ export async function POST(request: Request) {
         message:
           "Project enquiry submitted successfully.",
         enquiryId: enquiry.id,
+        emailDelivered,
+        emailId,
+        country: cleanCountry,
+        countryCode: cleanCountryCode,
+        currency: cleanCurrency,
       },
       { status: 201 }
     );
